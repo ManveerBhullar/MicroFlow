@@ -16,6 +16,7 @@ import (
 	"github.com/micro-editor/micro/v2/internal/buffer"
 	"github.com/micro-editor/micro/v2/internal/clipboard"
 	"github.com/micro-editor/micro/v2/internal/config"
+	"github.com/micro-editor/micro/v2/internal/llm"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/shell"
 	"github.com/micro-editor/micro/v2/internal/util"
@@ -54,6 +55,11 @@ func InitCommands() {
 		"help":        {(*BufPane).HelpCmd, HelpComplete},
 		"eval":        {(*BufPane).EvalCmd, nil},
 		"log":         {(*BufPane).ToggleLogCmd, nil},
+		"llm":         {(*BufPane).LLMCmd, nil},
+		"llm-chat":    {(*BufPane).LLMChatCmd, nil},
+		"llm-insert":  {(*BufPane).LLMInsertCmd, nil},
+		"llm-status":  {(*BufPane).LLMStatusCmd, nil},
+		"llm-stats":   {(*BufPane).LLMStatsCmd, nil},
 		"plugin":      {(*BufPane).PluginCmd, PluginComplete},
 		"reload":      {(*BufPane).ReloadCmd, nil},
 		"reopen":      {(*BufPane).ReopenCmd, nil},
@@ -68,6 +74,77 @@ func InitCommands() {
 		"raw":         {(*BufPane).RawCmd, nil},
 		"textfilter":  {(*BufPane).TextFilterCmd, nil},
 	}
+}
+
+// LLMCmd sends a natural-language edit request to the local LLM.
+func (h *BufPane) LLMCmd(args []string) {
+	h.LLMChatCmd(args)
+}
+
+// LLMChatCmd sends a natural-language edit request to the local LLM.
+func (h *BufPane) LLMChatCmd(args []string) {
+	wholeFile := false
+	if len(args) > 0 && strings.EqualFold(args[0], "file") {
+		wholeFile = true
+		args = args[1:]
+	}
+	instruction := strings.TrimSpace(strings.Join(args, " "))
+	if instruction == "" {
+		h.LLMChat()
+		return
+	}
+	if wholeFile {
+		h.StartLLMChatEdit(instruction, true)
+		return
+	}
+	if h.Cursor.HasSelection() {
+		h.StartLLMChatEdit(instruction, false)
+		return
+	}
+	if llmWantsWholeFileEdit(instruction) {
+		h.StartLLMChatEdit(instruction, true)
+		return
+	}
+	InfoBar.YNPrompt("No selection. Apply chat edit to whole file? (y,n,esc)", func(yes, canceled bool) {
+		if canceled || !yes {
+			return
+		}
+		h.StartLLMChatEdit(instruction, true)
+	})
+}
+
+// LLMInsertCmd keeps the explicit insert-at-cursor flow available without
+// overloading chat/edit semantics.
+func (h *BufPane) LLMInsertCmd(args []string) {
+	instruction := strings.TrimSpace(strings.Join(args, " "))
+	if instruction == "" {
+		h.LLMAsk()
+		return
+	}
+	h.StartLLMInstruction(instruction)
+}
+
+// LLMStatusCmd shows the active provider settings MicroFlow will use.
+func (h *BufPane) LLMStatusCmd(args []string) {
+	apikey := config.GetGlobalOption("llm.apikey").(string)
+	if apikey != "" {
+		apikey = "***"
+	}
+	InfoBar.Message(fmt.Sprintf(
+		"llm enabled=%v autosuggest=%v baseurl=%s model=%s promptmode=%s debug=%v apikey=%s",
+		config.GetGlobalOption("llm.enabled"),
+		config.GetGlobalOption("llm.autosuggest"),
+		config.GetGlobalOption("llm.baseurl"),
+		config.GetGlobalOption("llm.model"),
+		config.GetGlobalOption("llm.promptmode"),
+		config.GetGlobalOption("llm.debug"),
+		apikey,
+	))
+}
+
+// LLMStatsCmd shows session-level LLM metrics.
+func (h *BufPane) LLMStatsCmd(args []string) {
+	InfoBar.Message(llm.FormatMetricsSummary())
 }
 
 // MakeCommand is a function to easily create new commands

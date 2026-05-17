@@ -277,6 +277,7 @@ func checkBackup(name string) error {
 }
 
 func exit(rc int) {
+	action.CancelLLM()
 	for _, b := range buffer.OpenBuffers {
 		if !b.Modified() {
 			b.Fini()
@@ -405,6 +406,7 @@ func main() {
 
 	action.InitBindings()
 	action.InitCommands()
+	action.InitLLM()
 
 	timerChan = make(chan func())
 
@@ -450,6 +452,8 @@ func main() {
 		config.SetAutoTime(a)
 	}
 
+	showSplash()
+
 	screen.Events = make(chan tcell.Event)
 
 	// Here is the event loop which runs in a separate thread
@@ -483,6 +487,29 @@ func main() {
 	}
 }
 
+func showSplash() {
+	w, h := screen.Screen.Size()
+	lines := []string{
+		"  __  __ _                 _____ _               ",
+		" |  \\/  (_)               |  ___| |              ",
+		" | .  . |_  ___ _ __ ___ | |_  | | _____      __",
+		" | |\\/| | |/ __| '__/ _ \\|  _| | |/ _ \\ \\ /\\ / /",
+		" | |  | | | (__| | | (_) | |   | | (_) \\ V  V / ",
+		" \\_|  |_/_|\\___|_|  \\___/\\_|   |_|\\___/ \\_/\\_/  ",
+	}
+	style := config.DefStyle.Bold(true)
+	screen.Screen.Fill(' ', config.DefStyle)
+	startY := (h - len(lines)) / 2
+	for i, line := range lines {
+		startX := (w - len(line)) / 2
+		for j, r := range line {
+			screen.Screen.SetContent(startX+j, startY+i, r, nil, style)
+		}
+	}
+	screen.Screen.Show()
+	time.Sleep(700 * time.Millisecond)
+}
+
 // DoEvent runs the main action loop of the editor
 func DoEvent() {
 	var event tcell.Event
@@ -509,6 +536,68 @@ func DoEvent() {
 		}
 	case <-shell.CloseTerms:
 		action.Tabs.CloseTerms()
+	case f := <-action.LLMStartChan:
+		f()
+	case resp := <-action.LLMRespChan:
+		if resp.Buf != nil {
+			if resp.Debug != "" {
+				action.WriteLog(resp.Debug)
+			}
+			c := resp.Buf.GetActiveCursor()
+			if resp.RequestID != 0 && resp.RequestID < resp.Buf.GhostRequestIDValue() {
+				break
+			}
+
+		if resp.StartedAt > 0 {
+			latencyBudget := int64(config.GetGlobalOption("llm.latencybudget").(float64))
+			if latencyBudget <= 0 {
+				latencyBudget = 5000
+			}
+			elapsed := time.Now().UnixMilli() - resp.StartedAt
+			if resp.Mode == "ghost-auto" && elapsed > latencyBudget {
+				break
+			}
+		}
+
+		resp.Buf.GhostCancel = nil
+			if resp.Mode == "edit-selection" || resp.Mode == "edit-file" {
+				resp.Buf.GhostText = ""
+				if resp.Err != nil {
+					action.InfoBar.Message(resp.Err.Error())
+				} else {
+					resp.Buf.Remove(resp.Start, resp.End)
+					resp.Buf.Insert(resp.Start, resp.Text)
+					c.GotoLoc(resp.Start.Move(util.CharacterCountInString(resp.Text), resp.Buf))
+					action.InfoBar.Message("")
+				}
+				screen.Redraw()
+				break
+			}
+			if c.Loc != resp.Loc {
+				resp.Buf.GhostText = ""
+				if resp.Mode != "ghost-auto" {
+					action.InfoBar.Message("")
+				}
+				screen.Redraw()
+				break
+			}
+			if resp.Err != nil {
+				if resp.Mode != "ghost-auto" {
+					action.InfoBar.Message(resp.Err.Error())
+				}
+			} else if resp.Mode == "insert" {
+				resp.Buf.GhostText = ""
+				resp.Buf.Insert(resp.Loc, resp.Text)
+				c.GotoLoc(resp.Loc.Move(util.CharacterCountInString(resp.Text), resp.Buf))
+				action.InfoBar.Message("")
+				screen.Redraw()
+			} else {
+				resp.Buf.GhostText = resp.Text
+				resp.Buf.GhostLoc = resp.Loc
+				action.InfoBar.Message("")
+				screen.Redraw()
+			}
+		}
 	case event = <-screen.Events:
 	case <-screen.DrawChan():
 		for len(screen.DrawChan()) > 0 {

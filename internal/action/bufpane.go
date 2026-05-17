@@ -426,6 +426,7 @@ func (h *BufPane) getReloadSetting() string {
 
 // HandleEvent executes the tcell event properly
 func (h *BufPane) HandleEvent(event tcell.Event) {
+	scheduleLLM := true
 	if h.Buf.ExternallyModified() && !h.Buf.ReloadDisabled {
 		reload := h.getReloadSetting()
 
@@ -460,8 +461,14 @@ func (h *BufPane) HandleEvent(event tcell.Event) {
 		h.Relocate()
 	case *tcell.EventKey:
 		ke := keyEvent(e)
+		if e.Key() == tcell.KeyEsc || e.Key() == tcell.KeyEscape {
+			scheduleLLM = false
+		}
 
 		done := h.DoKeyEvent(ke)
+		if done {
+			scheduleLLM = false
+		}
 		if !done && e.Key() == tcell.KeyRune {
 			h.DoRuneInsert(e.Rune())
 		}
@@ -523,6 +530,10 @@ func (h *BufPane) HandleEvent(event tcell.Event) {
 			(c.NewTrailingWsY != c.CurSelection[0].Y && c.NewTrailingWsY != c.CurSelection[1].Y)) {
 			c.NewTrailingWsY = -1
 		}
+	}
+
+	if scheduleLLM {
+		h.ScheduleLLMAutosuggest()
 	}
 }
 
@@ -786,6 +797,12 @@ var BufKeyActions = map[string]BufKeyAction{
 	"MoveLinesDown":             (*BufPane).MoveLinesDown,
 	"IndentSelection":           (*BufPane).IndentSelection,
 	"OutdentSelection":          (*BufPane).OutdentSelection,
+	"DismissGhostText":          (*BufPane).DismissGhostText,
+	"AcceptGhostText":           (*BufPane).AcceptGhostText,
+	"AcceptGhostWord":           (*BufPane).AcceptGhostWord,
+	"LLMComplete":               (*BufPane).LLMComplete,
+	"LLMChat":                   (*BufPane).LLMChat,
+	"LLMAsk":                    (*BufPane).LLMAsk,
 	"Autocomplete":              (*BufPane).Autocomplete,
 	"CycleAutocompleteBack":     (*BufPane).CycleAutocompleteBack,
 	"OutdentLine":               (*BufPane).OutdentLine,

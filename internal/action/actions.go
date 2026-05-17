@@ -1,6 +1,7 @@
 package action
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -9,12 +10,15 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/micro-editor/micro/v2/internal/buffer"
 	"github.com/micro-editor/micro/v2/internal/clipboard"
 	"github.com/micro-editor/micro/v2/internal/config"
 	"github.com/micro-editor/micro/v2/internal/display"
+	"github.com/micro-editor/micro/v2/internal/llm"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/shell"
 	"github.com/micro-editor/micro/v2/internal/util"
@@ -254,6 +258,7 @@ func (h *BufPane) MoveCursorDown(n int) {
 
 // CursorUp moves the cursor up
 func (h *BufPane) CursorUp() bool {
+	h.Buf.ClearGhostState()
 	h.Cursor.Deselect(true)
 	h.MoveCursorUp(1)
 	h.Relocate()
@@ -262,6 +267,7 @@ func (h *BufPane) CursorUp() bool {
 
 // CursorDown moves the cursor down
 func (h *BufPane) CursorDown() bool {
+	h.Buf.ClearGhostState()
 	selectionEndNewline := h.Cursor.HasSelection() && h.Cursor.CurSelection[1].X == 0
 	h.Cursor.Deselect(false)
 	if selectionEndNewline {
@@ -275,6 +281,7 @@ func (h *BufPane) CursorDown() bool {
 
 // CursorLeft moves the cursor left
 func (h *BufPane) CursorLeft() bool {
+	h.Buf.ClearGhostState()
 	if h.Cursor.HasSelection() {
 		h.Cursor.Deselect(true)
 	} else {
@@ -300,6 +307,7 @@ func (h *BufPane) CursorLeft() bool {
 
 // CursorRight moves the cursor right
 func (h *BufPane) CursorRight() bool {
+	h.Buf.ClearGhostState()
 	if h.Cursor.HasSelection() {
 		h.Cursor.Deselect(false)
 	} else {
@@ -927,6 +935,527 @@ func (h *BufPane) Autocomplete() bool {
 	}
 
 	return b.Autocomplete(buffer.BufferComplete)
+}
+
+// AcceptGhostText inserts pending LLM ghost text into the buffer.
+func (h *BufPane) AcceptGhostText() bool {
+	b := h.Buf
+	if b.GhostText == "" {
+		return false
+	}
+	if h.Cursor.Loc != b.GhostLoc {
+		b.GhostText = ""
+		return false
+	}
+
+	text := b.GhostText
+	loc := b.GhostLoc
+	if b.GhostCancel != nil {
+		b.GhostCancel()
+	}
+	b.GhostCancel = nil
+	b.NextGhostRequestID()
+	b.GhostText = ""
+	b.Insert(loc, text)
+	llm.RecordCompletion(llm.CompletionEvent{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Mode:      "ghost",
+		Accepted:  true,
+		Status:    "accepted",
+	})
+	h.Relocate()
+	return true
+}
+
+// AcceptGhostWord accepts a single word from the ghost text, keeping the rest as ghost.
+// Returns false if there's no ghost text to accept (allows fallback to WordRight in chains).
+func (h *BufPane) AcceptGhostWord() bool {
+	b := h.Buf
+	if b.GhostText == "" {
+		return false
+	}
+	if h.Cursor.Loc != b.GhostLoc {
+		b.GhostText = ""
+		return false
+	}
+
+	ghost := b.GhostText
+	wordEnd := 0
+	for i, r := range ghost {
+		if r == '\n' {
+			wordEnd = i
+			break
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			wordEnd = i + utf8.RuneLen(r)
+			continue
+		}
+		if wordEnd > 0 {
+			break
+		}
+		wordEnd = i + utf8.RuneLen(r)
+		break
+	}
+	if wordEnd == 0 {
+		wordEnd = len(ghost)
+	}
+	if wordEnd > len(ghost) {
+		wordEnd = len(ghost)
+	}
+
+	word := ghost[:wordEnd]
+	rest := ghost[wordEnd:]
+
+	b.Insert(b.GhostLoc, word)
+
+	if rest == "" {
+		b.GhostText = ""
+		if b.GhostCancel != nil {
+			b.GhostCancel()
+			b.GhostCancel = nil
+		}
+		b.NextGhostRequestID()
+	} else {
+		b.GhostLoc = h.Cursor.Loc
+		b.GhostText = rest
+	}
+	h.Relocate()
+	return true
+}
+
+// DismissGhostText clears the pending LLM ghost suggestion.
+func (h *BufPane) DismissGhostText() bool {
+	b := h.Buf
+	if b.GhostText == "" {
+		return false
+	}
+	b.ClearGhostState()
+	return true
+}
+
+// LLMComplete starts an asynchronous OpenAI-compatible completion request.
+func (h *BufPane) LLMComplete() bool {
+	if h.Buf.GhostText != "" {
+		return false
+	}
+	return h.StartLLMGhostRequest(false, 0)
+}
+
+// ScheduleLLMAutosuggest debounces an automatic ghost completion request.
+func (h *BufPane) ScheduleLLMAutosuggest() {
+	if !h.canStartLLMGhost(true) {
+		return
+	}
+
+	b := h.Buf
+	b.ClearGhostState()
+	requestID := b.GhostRequestIDValue()
+
+	delay := int(config.GetGlobalOption("llm.debounce").(float64))
+	if delay < 0 {
+		delay = 0
+	}
+
+	lastLatMs := llm.GetLastLatencyMs()
+	if lastLatMs > 0 {
+		adaptiveDelay := int(lastLatMs / 2)
+		maxDebounce := int(config.GetGlobalOption("llm.debounce").(float64))
+		if maxDebounce > 0 && adaptiveDelay > maxDebounce {
+			adaptiveDelay = maxDebounce
+		}
+		if adaptiveDelay > delay {
+			delay = adaptiveDelay
+		}
+	}
+
+	b.GhostTimer = time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
+		select {
+		case LLMStartChan <- func() {
+			if b.GhostRequestIDValue() == requestID {
+				h.StartLLMGhostRequest(true, requestID)
+			}
+		}:
+		default:
+		}
+	})
+}
+
+func (h *BufPane) canStartLLMGhost(auto bool) bool {
+	if !config.GetGlobalOption("llm.enabled").(bool) {
+		if !auto {
+			InfoBar.Message("llm.enabled is false")
+		}
+		return false
+	}
+	if auto && !config.GetGlobalOption("llm.autosuggest").(bool) {
+		return false
+	}
+	if InfoBar != nil && InfoBar.HasPrompt {
+		if !auto {
+			InfoBar.Message("close the prompt before requesting completion")
+		}
+		return false
+	}
+	b := h.Buf
+	if b == nil || b.Type == buffer.BTInfo {
+		return false
+	}
+	if b.Type.Readonly {
+		if !auto {
+			InfoBar.Message("buffer is readonly")
+		}
+		return false
+	}
+	if h.Cursor.HasSelection() {
+		if !auto {
+			InfoBar.Message("clear selection before tab completion")
+		}
+		return false
+	}
+	if auto && b.HasSuggestions {
+		return false
+	}
+	if auto && llmFiletypeDisabled(b.FileType()) {
+		return false
+	}
+	if !auto && b.HasSuggestions {
+		b.HasSuggestions = false
+	}
+	cc := llm.BuildFIMContext(b, int(config.GetGlobalOption("llm.contextlines").(float64)))
+	if auto {
+		return strings.TrimSpace(cc.Prefix) != ""
+	}
+	return true
+}
+
+func (h *BufPane) StartLLMGhostRequest(auto bool, requestID int64) bool {
+	if !h.canStartLLMGhost(auto) {
+		return false
+	}
+
+	b := h.Buf
+	if requestID == 0 {
+		b.ClearGhostState()
+		requestID = b.GhostRequestIDValue()
+	} else {
+		if b.GhostTimer != nil {
+			b.GhostTimer.Stop()
+			b.GhostTimer = nil
+		}
+		if b.GhostCancel != nil {
+			b.GhostCancel()
+			b.GhostCancel = nil
+		}
+		b.GhostText = ""
+	}
+
+	nLines := int(config.GetGlobalOption("llm.contextlines").(float64))
+	cc := llm.BuildFIMContext(b, nLines)
+	prefix, suffix := llm.TrimContext(cc.Prefix, cc.Suffix,
+		int(config.GetGlobalOption("llm.maxinputchars").(float64)),
+		config.GetGlobalOption("llm.maxsuffixpercentage").(float64))
+	req := h.newLLMRequest(prefix, suffix, "")
+	req.MidLine = cc.MidLine
+	req.MidToken = cc.MidToken
+	req.PartialWord = cc.PartialWord
+	if req.PromptMode == "fim" && !auto && strings.TrimSpace(prefix) == "" {
+		req.PromptMode = "chat"
+	}
+
+	ctx, cancel := context.WithCancel(LLMContext)
+	b.GhostCancel = cancel
+	ghostLoc := h.Cursor.Loc
+	mode := "ghost"
+	if auto {
+		mode = "ghost-auto"
+	}
+	req.RequestStart = time.Now()
+
+	go func() {
+		start := time.Now()
+		llmDispatchDebug(req, mode)
+		if !auto {
+			WriteLog(fmt.Sprintf("[llm] tab completion dispatch model=%s baseurl=%s filetype=%s\n", req.Model, req.BaseURL, req.FileType))
+		}
+		text, err := llm.Complete(ctx, req)
+		elapsed := time.Since(start)
+		debug := llmDebugLine(req, mode, elapsed, text, err)
+		if ctx.Err() != nil {
+			return
+		}
+
+		var score float64
+		if err == nil && text != "" {
+			score = llm.ScoreCompletion(text, req)
+			if auto && score < 0.2 {
+				llm.RecordCompletion(llm.CompletionEvent{
+					Timestamp: time.Now().Format(time.RFC3339),
+					Mode:      mode, Model: req.Model, FileType: req.FileType,
+					LatencyMs: elapsed.Milliseconds(), OutputChars: len(text),
+					Score: score, Status: "rejected-low-score",
+				})
+				return
+			}
+		}
+
+		resp := LLMResponse{Buf: b, Text: text, Loc: ghostLoc, RequestID: requestID, Mode: mode, Debug: debug, Score: score, StartedAt: start.UnixMilli()}
+		if err != nil {
+			resp.Err = err
+		} else if text == "" {
+			resp.Err = errors.New("llm: empty completion")
+		}
+
+		llm.RecordCompletion(llm.CompletionEvent{
+			Timestamp: time.Now().Format(time.RFC3339),
+			Mode:      mode, Model: req.Model, FileType: req.FileType,
+			LatencyMs: elapsed.Milliseconds(),
+			InputChars: len(prefix) + len(suffix), OutputChars: len(text),
+			Score: score, Status: "ok",
+		})
+
+		SendLLMResponse(resp)
+	}()
+
+	if !auto {
+		InfoBar.Message(fmt.Sprintf("LLM completion: %s -> %s", req.Model, req.BaseURL))
+	}
+	return true
+}
+
+// LLMChat opens a natural-language edit prompt. It edits the current selection
+// when present, otherwise it asks before applying the instruction to the file.
+func (h *BufPane) LLMChat() bool {
+	InfoBar.Prompt("Chat edit: ", "", "LLMChat", nil, func(resp string, canceled bool) {
+		if canceled || strings.TrimSpace(resp) == "" {
+			return
+		}
+		if h.Cursor.HasSelection() {
+			h.StartLLMChatEdit(resp, false)
+			return
+		}
+		if llmWantsWholeFileEdit(resp) {
+			h.StartLLMChatEdit(resp, true)
+			return
+		}
+		InfoBar.YNPrompt("No selection. Apply chat edit to whole file? (y,n,esc)", func(yes, canceled bool) {
+			if canceled || !yes {
+				return
+			}
+			h.StartLLMChatEdit(resp, true)
+		})
+	})
+	return true
+}
+
+// LLMAsk opens a prompt for an instruction and inserts the LLM result at the cursor.
+func (h *BufPane) LLMAsk() bool {
+	InfoBar.Prompt("Insert code: ", "", "LLMInsert", nil, func(resp string, canceled bool) {
+		if canceled || strings.TrimSpace(resp) == "" {
+			return
+		}
+		h.StartLLMInstruction(resp)
+	})
+	return true
+}
+
+// StartLLMInstruction starts an async instruction-driven code generation request.
+func (h *BufPane) StartLLMInstruction(instruction string) bool {
+	if !config.GetGlobalOption("llm.enabled").(bool) {
+		InfoBar.Message("llm.enabled is false")
+		return false
+	}
+
+	b := h.Buf
+	if h.Cursor.HasSelection() {
+		return false
+	}
+	b.ClearGhostState()
+
+	nLines := int(config.GetGlobalOption("llm.contextlines").(float64))
+	cc := llm.BuildFIMContext(b, nLines)
+	prefix, suffix := h.trimLLMContext(cc.Prefix, cc.Suffix)
+	req := h.newLLMRequest(prefix, suffix, instruction)
+	req.MidLine = cc.MidLine
+	req.MidToken = cc.MidToken
+	req.PartialWord = cc.PartialWord
+
+	ctx, cancel := context.WithCancel(LLMContext)
+	b.GhostCancel = cancel
+	requestID := b.GhostRequestIDValue()
+	insertLoc := h.Cursor.Loc
+
+	go func() {
+		start := time.Now()
+		llmDispatchDebug(req, "insert")
+		text, err := llm.Complete(ctx, req)
+		debug := llmDebugLine(req, "insert", time.Since(start), text, err)
+		if ctx.Err() != nil {
+			return
+		}
+		resp := LLMResponse{Buf: b, Text: text, Loc: insertLoc, RequestID: requestID, Mode: "insert", Debug: debug}
+		if err != nil {
+			resp.Err = err
+		} else if text == "" {
+			resp.Err = errors.New("llm: empty response")
+		}
+		SendLLMResponse(resp)
+	}()
+
+	InfoBar.Message("LLM writing...")
+	return true
+}
+
+// StartLLMChatEdit starts an async natural-language edit request.
+func (h *BufPane) StartLLMChatEdit(instruction string, wholeFile bool) bool {
+	if !config.GetGlobalOption("llm.enabled").(bool) {
+		InfoBar.Message("llm.enabled is false")
+		return false
+	}
+
+	b := h.Buf
+	if b == nil || b.Type.Readonly || b.Type == buffer.BTInfo {
+		return false
+	}
+	if !wholeFile && !h.Cursor.HasSelection() {
+		InfoBar.Message("Select code to edit, or run: llm file <instruction>")
+		return false
+	}
+	b.ClearGhostState()
+
+	start, end := b.Start(), b.End()
+	prefix := string(b.Bytes())
+	suffix := ""
+	selection := ""
+	mode := "edit-file"
+	if !wholeFile {
+		start, end = h.selectionBounds()
+		prefix = string(b.Substr(b.Start(), start))
+		suffix = string(b.Substr(end, b.End()))
+		selection = string(b.Substr(start, end))
+		mode = "edit-selection"
+	}
+
+	req := h.newLLMRequest(prefix, suffix, instruction)
+	req.Task = "edit"
+	req.Selection = selection
+	req.MaxToks = int(config.GetGlobalOption("llm.edittokens").(float64))
+
+	ctx, cancel := context.WithCancel(LLMContext)
+	b.GhostCancel = cancel
+	requestID := b.GhostRequestIDValue()
+
+	go func() {
+		startTime := time.Now()
+		llmDispatchDebug(req, mode)
+		text, err := llm.Complete(ctx, req)
+		debug := llmDebugLine(req, mode, time.Since(startTime), text, err)
+		if ctx.Err() != nil {
+			return
+		}
+		resp := LLMResponse{Buf: b, Text: text, Start: start, End: end, RequestID: requestID, Mode: mode, Debug: debug}
+		if err != nil {
+			resp.Err = err
+		} else if text == "" {
+			resp.Err = errors.New("llm: empty edit")
+		}
+		SendLLMResponse(resp)
+	}()
+
+	InfoBar.Message("LLM editing...")
+	return true
+}
+
+func (h *BufPane) newLLMRequest(prefix, suffix, instruction string) llm.Request {
+	b := h.Buf
+	return llm.Request{
+		Prefix:      prefix,
+		Suffix:      suffix,
+		Instruction: instruction,
+		FileName:    b.AbsPath,
+		FileType:    b.FileType(),
+		PromptMode:  config.GetGlobalOption("llm.promptmode").(string),
+		Model:       config.GetGlobalOption("llm.model").(string),
+		BaseURL:     config.GetGlobalOption("llm.baseurl").(string),
+		APIKey:      config.GetGlobalOption("llm.apikey").(string),
+		MaxToks:     int(config.GetGlobalOption("llm.maxtokens").(float64)),
+		Timeout:     int(config.GetGlobalOption("llm.timeout").(float64)),
+	}
+}
+
+func (h *BufPane) trimLLMContext(prefix, suffix string) (string, string) {
+	return llm.TrimContext(
+		prefix,
+		suffix,
+		int(config.GetGlobalOption("llm.maxinputchars").(float64)),
+		config.GetGlobalOption("llm.maxsuffixpercentage").(float64),
+	)
+}
+
+func (h *BufPane) selectionBounds() (buffer.Loc, buffer.Loc) {
+	start := h.Cursor.CurSelection[0]
+	end := h.Cursor.CurSelection[1]
+	if start.GreaterThan(end) {
+		start, end = end, start
+	}
+	return start, end
+}
+
+func llmWantsWholeFileEdit(instruction string) bool {
+	lower := strings.ToLower(instruction)
+	return strings.Contains(lower, "whole file") ||
+		strings.Contains(lower, "entire file") ||
+		strings.Contains(lower, "cleanup file") ||
+		strings.Contains(lower, "clean up file") ||
+		strings.Contains(lower, "rewrite file") ||
+		strings.Contains(lower, "refactor file")
+}
+
+func llmFiletypeDisabled(filetype string) bool {
+	for _, disabled := range strings.Split(config.GetGlobalOption("llm.disablefiletypes").(string), ",") {
+		if strings.EqualFold(strings.TrimSpace(disabled), filetype) {
+			return true
+		}
+	}
+	return false
+}
+
+func llmDispatchDebug(req llm.Request, mode string) {
+	if !config.GetGlobalOption("llm.debug").(bool) {
+		return
+	}
+	WriteLog(fmt.Sprintf(
+		"[llm] dispatch mode=%s model=%s baseurl=%s promptmode=%s filetype=%s prefix_chars=%d suffix_chars=%d instruction_chars=%d\n",
+		mode,
+		req.Model,
+		req.BaseURL,
+		req.PromptMode,
+		req.FileType,
+		len([]rune(req.Prefix)),
+		len([]rune(req.Suffix)),
+		len([]rune(req.Instruction)),
+	))
+}
+
+func llmDebugLine(req llm.Request, mode string, elapsed time.Duration, text string, err error) string {
+	if !config.GetGlobalOption("llm.debug").(bool) {
+		return ""
+	}
+	status := "ok"
+	if err != nil {
+		status = err.Error()
+	}
+	return fmt.Sprintf(
+		"[llm] mode=%s model=%s promptmode=%s filetype=%s elapsed=%s prefix_chars=%d suffix_chars=%d response_chars=%d status=%s\n",
+		mode,
+		req.Model,
+		req.PromptMode,
+		req.FileType,
+		elapsed.Round(time.Millisecond),
+		len([]rune(req.Prefix)),
+		len([]rune(req.Suffix)),
+		len([]rune(text)),
+		status,
+	)
 }
 
 // CycleAutocompleteBack cycles back in the autocomplete suggestion list

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	luar "layeh.com/gopher-luar"
@@ -121,10 +122,39 @@ type SharedBuffer struct {
 
 	// Hash of the original buffer -- empty if fastdirty is on
 	origHash [md5.Size]byte
+
+	// Ghost text for LLM tab completion.
+	GhostText      string
+	GhostLoc       Loc
+	GhostCancel    func()
+	ghostRequestID int64
+	GhostTimer     *time.Timer
+}
+
+func (b *SharedBuffer) NextGhostRequestID() int64 {
+	return atomic.AddInt64(&b.ghostRequestID, 1)
+}
+
+func (b *SharedBuffer) GhostRequestIDValue() int64 {
+	return atomic.LoadInt64(&b.ghostRequestID)
+}
+
+func (b *SharedBuffer) ClearGhostState() {
+	b.NextGhostRequestID()
+	if b.GhostTimer != nil {
+		b.GhostTimer.Stop()
+		b.GhostTimer = nil
+	}
+	if b.GhostCancel != nil {
+		b.GhostCancel()
+		b.GhostCancel = nil
+	}
+	b.GhostText = ""
+	b.HasSuggestions = false
 }
 
 func (b *SharedBuffer) insert(pos Loc, value []byte) {
-	b.HasSuggestions = false
+	b.ClearGhostState()
 	b.LineArray.insert(pos, value)
 	b.setModified()
 
@@ -133,7 +163,7 @@ func (b *SharedBuffer) insert(pos Loc, value []byte) {
 }
 
 func (b *SharedBuffer) remove(start, end Loc) []byte {
-	b.HasSuggestions = false
+	b.ClearGhostState()
 	defer b.setModified()
 	defer b.MarkModified(start.Y, end.Y)
 	return b.LineArray.remove(start, end)
@@ -929,6 +959,66 @@ func (b *Buffer) UpdateRules() {
 			} else if header.FileType == ft {
 				syntaxFile = f.Name()
 				break
+			}
+		}
+	}
+
+	if !foundDef && syntaxFile == "" && len(fnameMatches) == 0 && len(headerMatches) == 0 {
+		// Fallback for builds that did not run `go generate ./runtime`: the
+		// embedded YAML syntax files are available, but generated .hdr files
+		// may be missing.
+		for _, f := range config.ListRuntimeFiles(config.RTSyntax) {
+			if f.Name() == "default" {
+				continue
+			}
+			data, err := f.Data()
+			if err != nil {
+				screen.TermMessage("Error loading syntax file " + f.Name() + ": " + err.Error())
+				continue
+			}
+			header, err = highlight.MakeHeaderYaml(data)
+			if err != nil {
+				screen.TermMessage("Error parsing header for syntax file " + f.Name() + ": " + err.Error())
+				continue
+			}
+
+			matchedFileType := false
+			matchedFileName := false
+			matchedFileHeader := false
+			if ft == "unknown" || ft == "" {
+				if header.MatchFileName(b.Path) {
+					matchedFileName = true
+				}
+				if len(fnameMatches) == 0 && header.MatchFileHeader(b.lines[0].data) {
+					matchedFileHeader = true
+				}
+			} else if header.FileType == ft {
+				matchedFileType = true
+			}
+			if !matchedFileType && !matchedFileName && !matchedFileHeader {
+				continue
+			}
+
+			file, err := highlight.ParseFile(data)
+			if err != nil {
+				screen.TermMessage("Error parsing syntax file " + f.Name() + ": " + err.Error())
+				continue
+			}
+			syndef, err := highlight.ParseDef(file, header)
+			if err != nil {
+				screen.TermMessage("Error parsing syntax file " + f.Name() + ": " + err.Error())
+				continue
+			}
+			if matchedFileType {
+				b.SyntaxDef = syndef
+				syntaxFile = f.Name()
+				foundDef = true
+				break
+			}
+			if matchedFileName {
+				fnameMatches = append(fnameMatches, syntaxFileInfo{header, f.Name(), syndef})
+			} else if matchedFileHeader {
+				headerMatches = append(headerMatches, syntaxFileInfo{header, f.Name(), syndef})
 			}
 		}
 	}

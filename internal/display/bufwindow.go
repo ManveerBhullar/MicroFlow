@@ -620,6 +620,9 @@ func (w *BufWindow) displayBuffer() {
 			if nColsBeforeStart > 0 || vloc.Y < 0 {
 				return
 			}
+			if vloc.X >= maxWidth {
+				return
+			}
 
 			if highlight {
 				if w.Buf.HighlightSearch && w.Buf.SearchMatch(bloc) {
@@ -682,6 +685,51 @@ func (w *BufWindow) displayBuffer() {
 					if c.X == bloc.X && c.Y == bloc.Y && !c.HasSelection() {
 						w.showCursor(w.X+vloc.X, w.Y+vloc.Y, c.Num == 0)
 					}
+				}
+			}
+		}
+
+		ghostDrawn := false
+		drawInlineGhost := func() {
+			if ghostDrawn || b.GhostText == "" || nColsBeforeStart > 0 || vloc.Y < 0 || vloc.Y >= w.bufHeight {
+				return
+			}
+
+			c := b.GetActiveCursor()
+			if c.Loc != b.GhostLoc || c.HasSelection() || c.Loc != bloc {
+				return
+			}
+
+			if w.active {
+				w.showCursor(w.X+vloc.X, w.Y+vloc.Y, c.Num == 0)
+			}
+
+			ghostDrawn = true
+			style := config.DefStyle.Foreground(tcell.ColorGray)
+			tabsize := util.IntOpt(b.Settings["tabsize"])
+			for _, r := range b.GhostText {
+				if r == '\n' {
+					return
+				}
+				if vloc.X >= maxWidth {
+					return
+				}
+
+				width := runewidth.RuneWidth(r)
+				drawRune := r
+				if r == '\t' {
+					width = tabsize - ((vloc.X - w.gutterOffset + w.StartCol) % tabsize)
+					drawRune = ' '
+				}
+				if width < 1 {
+					width = 1
+				}
+
+				screen.SetContent(w.X+vloc.X, w.Y+vloc.Y, drawRune, nil, style)
+				vloc.X++
+				for i := 1; i < width && vloc.X < maxWidth; i++ {
+					screen.SetContent(w.X+vloc.X, w.Y+vloc.Y, ' ', nil, style)
+					vloc.X++
 				}
 			}
 		}
@@ -772,6 +820,7 @@ func (w *BufWindow) displayBuffer() {
 			}
 
 			for _, r := range word {
+				drawInlineGhost()
 				drawrune, drawstyle, preservebg := getRuneStyle(r.r, r.style, 0, linex, false)
 				draw(drawrune, r.combc, drawstyle, true, true, preservebg)
 
@@ -825,6 +874,8 @@ func (w *BufWindow) displayBuffer() {
 			screen.SetContent(i+w.X, vloc.Y+w.Y, ' ', nil, curStyle)
 		}
 
+		drawInlineGhost()
+
 		if vloc.X != maxWidth {
 			// Display newline within a selection
 			drawrune, drawstyle, preservebg := getRuneStyle(' ', config.DefStyle, 0, totalwidth, true)
@@ -835,6 +886,68 @@ func (w *BufWindow) displayBuffer() {
 		bloc.Y++
 		if bloc.Y >= b.LinesNum() {
 			break
+		}
+	}
+
+	// Ghost text is injected into the render stream above so text after the
+	// cursor is visually shifted instead of overwritten.
+}
+
+func (w *BufWindow) drawGhostText() {
+	b := w.Buf
+	if b.GhostText == "" || w.bufHeight <= 0 || w.bufWidth <= 0 {
+		return
+	}
+
+	c := b.GetActiveCursor()
+	if c.Loc != b.GhostLoc || c.HasSelection() {
+		return
+	}
+
+	if !strings.ContainsRune(b.GhostText, '\n') {
+		return
+	}
+
+	vloc := w.VLocFromLoc(c.Loc)
+	y := w.Diff(w.StartLine, vloc.SLoc)
+	x := w.gutterOffset + vloc.VisualX - w.StartCol
+	maxWidth := w.gutterOffset + w.bufWidth
+	if y < 0 || y >= w.bufHeight || x < w.gutterOffset || x >= maxWidth {
+		return
+	}
+
+	style := config.DefStyle.Foreground(tcell.ColorGray)
+	tabsize := util.IntOpt(b.Settings["tabsize"])
+	for _, r := range b.GhostText {
+		if y < 0 || y >= w.bufHeight {
+			return
+		}
+		if r == '\n' {
+			y++
+			x = w.gutterOffset
+			continue
+		}
+		if x >= maxWidth {
+			y++
+			x = w.gutterOffset
+			continue
+		}
+
+		width := runewidth.RuneWidth(r)
+		drawRune := r
+		if r == '\t' {
+			width = tabsize - ((x - w.gutterOffset + w.StartCol) % tabsize)
+			drawRune = ' '
+		}
+		if width < 1 {
+			width = 1
+		}
+
+		screen.SetContent(w.X+x, w.Y+y, drawRune, nil, style)
+		x++
+		for i := 1; i < width && x < maxWidth; i++ {
+			screen.SetContent(w.X+x, w.Y+y, ' ', nil, style)
+			x++
 		}
 	}
 }
@@ -900,4 +1013,5 @@ func (w *BufWindow) Display() {
 	w.displayStatusLine()
 	w.displayScrollBar()
 	w.displayBuffer()
+	w.drawGhostText()
 }
