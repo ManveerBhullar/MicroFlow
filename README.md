@@ -1,30 +1,32 @@
-<img alt="micro logo" src="./assets/micro-logo-drop.svg" width="500px"/>
+# MicroFlow
 
-![Test Workflow](https://github.com/micro-editor/micro/actions/workflows/test.yaml/badge.svg)
-[![Go Report Card](https://goreportcard.com/badge/github.com/micro-editor/micro/v2)](https://goreportcard.com/report/github.com/micro-editor/micro/v2)
-[![Release](https://img.shields.io/github/release/micro-editor/micro.svg?label=Release)](https://github.com/micro-editor/micro/releases)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/micro-editor/micro/blob/master/LICENSE)
-[![Join the chat at https://gitter.im/zyedidia/micro](https://badges.gitter.im/zyedidia/micro.svg)](https://gitter.im/zyedidia/micro?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![Snap Status](https://snapcraft.io/micro/badge.svg)](https://snapcraft.io/micro)
+MicroFlow is a local-first AI code editor for the terminal, forked from the
+excellent [micro](https://github.com/micro-editor/micro) editor. It keeps
+micro's fast terminal editing model and adds automatic inline code suggestions
+backed by an OpenAI-compatible local model endpoint such as Ollama.
 
-**micro** is a terminal-based text editor that aims to be easy to use and intuitive, while also taking advantage of the capabilities
-of modern terminals. It comes as a single, batteries-included, static binary with no dependencies; you can download and use it right now!
+The current default LLM setup targets Ollama at `http://localhost:11434/v1` with
+`qwen2.5-coder:7b`. Suggestions appear automatically as you type, `Tab` accepts
+ghost text, `Esc` dismisses it, and `CtrlSpace` opens an explicit instruction
+prompt for writing code at the cursor.
 
-As its name indicates, micro aims to be somewhat of a successor to the nano editor by being easy to install and use.
-It strives to be enjoyable as a full-time editor for people who prefer to work in a terminal, or those who regularly edit files over SSH.
+MicroFlow is early-stage fork work. The upstream micro documentation below is
+kept where it still applies, and fork-specific behavior is documented in
+[FORK.md](./FORK.md).
 
-Here is a picture of micro editing its source code.
+Here is a picture of upstream micro editing its source code.
 
 ![Screenshot](./assets/micro-solarized.png)
 
-To see more screenshots of micro, showcasing some of the default color schemes, see [here](https://micro-editor.github.io).
-
-You can also check out the website for Micro at https://micro-editor.github.io.
+To see more screenshots of upstream micro, showcasing some of the default color
+schemes, see [here](https://micro-editor.github.io).
 
 - - -
 
 ## Features
 
+- Local-first LLM autosuggestions through Ollama/OpenAI-compatible endpoints.
+- `Tab` accepts ghost text; `CtrlSpace` opens an explicit LLM instruction prompt.
 - Easy to use and install.
 - No dependencies or external files are needed — just the binary you can download further down the page.
 - Multiple cursors.
